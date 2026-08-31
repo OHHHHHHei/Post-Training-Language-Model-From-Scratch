@@ -8,6 +8,7 @@ from torch import Tensor
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 from cs336_alignment.grpo import (
+    compute_group_normalized_rewards,
     compute_rollout_rewards,
     get_response_log_probs,
     tokenize_prompt_and_output,
@@ -170,7 +171,13 @@ def run_compute_group_normalized_rewards(
                 your choice of other statistics to log (e.g. mean, std, max/min
                 of rewards).
     """
-    raise NotImplementedError
+    return compute_group_normalized_rewards(
+        raw_rewards=raw_rewards,
+        group_size=group_size,
+        baseline=baseline,
+        advantage_eps=advantage_eps,
+        advantage_normalizer=advantage_normalizer,
+    )
 
 
 def run_compute_policy_gradient_loss(
