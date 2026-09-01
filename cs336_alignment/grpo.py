@@ -92,8 +92,19 @@ def get_response_log_probs(
     }
 
     if return_token_entropy:
-        probs = all_log_probs.exp()
-        token_entropy = -(probs * all_log_probs).sum(dim=-1)
+        # Entropy is only used for logging. Compute it in small vocabulary
+        # chunks so we do not materialize another full [B, T, V] tensor.
+        with torch.no_grad():
+            token_entropy = torch.zeros(
+                all_log_probs.shape[:-1],
+                device=all_log_probs.device,
+                dtype=torch.float32,
+            )
+            for log_prob_chunk in all_log_probs.detach().split(1024, dim=-1):
+                log_prob_chunk = log_prob_chunk.float()
+                token_entropy -= (
+                    log_prob_chunk.exp() * log_prob_chunk
+                ).sum(dim=-1)
         result["token_entropy"] = token_entropy
 
     return result
@@ -312,6 +323,14 @@ def grpo_train_step(
     labels = tokenized["labels"]
     response_mask = tokenized["response_mask"]
 
+    # Tokenization and reward computation happen on CPU, while the policy is
+    # normally on GPU. Move every tensor used by the forward pass together.
+    device = next(model.parameters()).device
+    input_ids = input_ids.to(device)
+    labels = labels.to(device)
+    response_mask = response_mask.to(device)
+    advantages = advantages.to(device)
+
     batch_size = len(rollout_responses)
     microbatch_size = batch_size // gradient_accumulation_steps
 
@@ -352,19 +371,27 @@ def grpo_train_step(
             loss_normalization="sequence",
         )
 
+        # 计算 microbatch 占完整 batch 的比例
         weight = (end - start) / batch_size
+        # 把当前 microbatch 的平均 loss 按样本比例缩放。
         scaled_loss = microbatch_loss * weight
 
+        # 执行反向传播，梯度会积累到 .grad 里面
         scaled_loss.backward()
 
+        # 记录 loss
         total_loss += scaled_loss.detach().item()
 
-        mask_float = mask_micro.to(token_entropy.dtype)
+        mask_float = mask_micro.to(
+            device=token_entropy.device,
+            dtype=token_entropy.dtype,
+        )
         entropy_sum += (
             (token_entropy * mask_float).sum().detach().item()
         )
         entropy_count += mask_float.sum().detach().item()
 
+    # 梯度裁剪
     if max_grad_norm is not None:
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(),
