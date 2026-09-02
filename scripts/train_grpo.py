@@ -1,6 +1,7 @@
 """Minimal standard on-policy GRPO training script for GSM8K."""
 
 import json
+import os
 import random
 from pathlib import Path
 
@@ -21,16 +22,18 @@ OUTPUT_DIR = Path("experiments/grpo_standard")
 
 N_TRAIN_EXAMPLES = 6400
 N_VAL_EXAMPLES = 1024
-NUM_ROLLOUT_STEPS = 50
+NUM_ROLLOUT_STEPS = int(os.environ.get("GRPO_STEPS", "50"))
 ROLLOUT_BATCH_SIZE = 256
 GROUP_SIZE = 8
-GRADIENT_ACCUMULATION_STEPS = 64
+GRADIENT_ACCUMULATION_STEPS = int(
+    os.environ.get("GRPO_GRAD_ACCUM", "64")
+)
 LEARNING_RATE = 1e-5
 TEMPERATURE = 1.0
 MAX_TOKENS = 512
 MAX_GRAD_NORM = 1.0
 EVAL_EVERY = 10
-SEED = 42
+SEED = int(os.environ.get("GRPO_SEED", "42"))
 
 POLICY_DEVICE = "cuda:0"
 VLLM_GPU = 2
@@ -53,13 +56,13 @@ def make_prompts(template: str, examples: list[dict[str, str]]):
     return prompts, answers
 
 
-def generate(server, prompts: list[str], seed: int):
+def generate(server, prompts: list[str], seed: int, n: int = 1):
     completions = server.generate_completions(
         prompts=prompts,
         sampling_params={
             "temperature": TEMPERATURE,
             "max_tokens": MAX_TOKENS,
-            "n": 1,
+            "n": n,
             "seed": seed,
             "stop": ["</answer>"],
             "include_stop_str_in_output": True,
@@ -69,17 +72,28 @@ def generate(server, prompts: list[str], seed: int):
     return [completion.text for completion in completions]
 
 
-def evaluate(server, template: str, examples: list[dict[str, str]], step: int):
+def evaluate(
+    server,
+    tokenizer,
+    template: str,
+    examples: list[dict[str, str]],
+    step: int,
+):
     prompts, answers = make_prompts(template, examples)
     responses = generate(server, prompts, SEED + 10000 + step)
     scores = [
         r1_zero_reward_fn(response, answer)
         for response, answer in zip(responses, answers)
     ]
+    response_tokenized = tokenizer(responses, add_special_tokens=False)
+    average_response_length = sum(
+        len(ids) for ids in response_tokenized["input_ids"]
+    ) / len(responses)
     return {
         "val_reward": sum(score["reward"] for score in scores) / len(scores),
         "val_format_reward": sum(score["format_reward"] for score in scores) / len(scores),
         "val_answer_reward": sum(score["answer_reward"] for score in scores) / len(scores),
+        "val_avg_response_length": average_response_length,
     }
 
 
@@ -126,6 +140,9 @@ def main():
     metrics_file = (OUTPUT_DIR / f"metrics_seed{SEED}.jsonl").open(
         "w", encoding="utf-8"
     )
+    rollouts_file = (OUTPUT_DIR / f"rollouts_seed{SEED}.jsonl").open(
+        "w", encoding="utf-8"
+    )
 
     try:
         server.init_weight_sync(POLICY_DEVICE)
@@ -139,7 +156,26 @@ def main():
 
             # Generate with the current policy.
             server.sync_policy_weights(policy)
-            responses = generate(server, repeated_prompts, SEED + step)
+            # Ask vLLM for GROUP_SIZE independent samples per prompt.
+            responses = generate(server, prompts, SEED + step, n=GROUP_SIZE)
+
+            if (step + 1) % 40 == 0:
+                for prompt, response, answer in zip(
+                    repeated_prompts, responses, repeated_answers
+                ):
+                    rollouts_file.write(
+                        json.dumps(
+                            {
+                                "step": step + 1,
+                                "prompt": prompt,
+                                "response": response,
+                                "ground_truth": answer,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                rollouts_file.flush()
 
             _, train_metrics = grpo_train_step(
                 model=policy,
@@ -161,7 +197,15 @@ def main():
             metrics = {"step": step + 1, **train_metrics}
             if (step + 1) % EVAL_EVERY == 0:
                 server.sync_policy_weights(policy)
-                metrics.update(evaluate(server, prompt_template, val_data, step + 1))
+                metrics.update(
+                    evaluate(
+                        server,
+                        tokenizer,
+                        prompt_template,
+                        val_data,
+                        step + 1,
+                    )
+                )
                 print(metrics)
             else:
                 print(
@@ -174,6 +218,7 @@ def main():
             metrics_file.flush()
     finally:
         metrics_file.close()
+        rollouts_file.close()
         server.stop()
 
 

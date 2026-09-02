@@ -156,20 +156,17 @@ def compute_group_normalized_rewards(
     advantage_eps: float = 1e-6,
     advantage_normalizer: Literal["std", "none", "mean"] = "std",
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    # 目前只实现标准 GRPO
-    if baseline != "mean":
-        raise NotImplementedError(
-            "Only baseline='mean' is supported for standard GRPO"
-        )
-
-    if advantage_normalizer != "std":
-        raise NotImplementedError(
-            "Only advantage_normalizer='std' is supported for standard GRPO"
-        )
-
     # group_size 必须是正数
     if group_size <= 0:
         raise ValueError("group_size must be positive")
+
+    if baseline not in {"mean", "none"}:
+        raise ValueError(f"Unsupported baseline: {baseline}")
+
+    if advantage_normalizer not in {"std", "none", "mean"}:
+        raise ValueError(
+            f"Unsupported advantage_normalizer: {advantage_normalizer}"
+        )
 
     # 把输入整理成一维
     raw_rewards = raw_rewards.reshape(-1)
@@ -190,9 +187,11 @@ def compute_group_normalized_rewards(
         keepdim=True,
     )
 
-    # baseline = mean
-    # 每个回答减去所在 group 的平均 reward
-    centered_rewards = grouped_rewards - group_means
+    # baseline = mean subtracts the group mean; baseline = none keeps raw rewards.
+    if baseline == "mean":
+        centered_rewards = grouped_rewards - group_means
+    else:
+        centered_rewards = grouped_rewards
 
     # 计算每组 reward 的标准差
     # shape: [num_groups, 1]
@@ -201,10 +200,12 @@ def compute_group_normalized_rewards(
         keepdim=True,
     )
 
-    # 标准 GRPO 的 advantage
-    advantages = centered_rewards / (
-        group_stds + advantage_eps
-    )
+    if advantage_normalizer == "std":
+        advantages = centered_rewards / (group_stds + advantage_eps)
+    elif advantage_normalizer == "none":
+        advantages = centered_rewards
+    else:
+        advantages = centered_rewards / (group_means + advantage_eps)
 
     # 恢复成一维，方便后面的 policy-gradient loss 使用
     advantages = advantages.reshape(-1)
@@ -249,11 +250,25 @@ def aggregate_loss_across_microbatch(
     normalization_constant: int | None = None,
 ) -> torch.Tensor:
 
+    if loss_normalization not in {"sequence", "constant"}:
+        raise ValueError(
+            f"Unsupported loss_normalization: {loss_normalization}"
+        )
+
     # 将 mask 转换成和 loss 一样的数据类型
     mask = mask.to(dtype=per_token_policy_gradient_loss.dtype)
 
     # 只保留 response token 的 loss
     masked_loss = per_token_policy_gradient_loss * mask
+
+    if loss_normalization == "constant":
+        if normalization_constant is None:
+            raise ValueError(
+                "normalization_constant is required for constant normalization"
+            )
+        if normalization_constant <= 0:
+            raise ValueError("normalization_constant must be positive")
+        return masked_loss.sum() / normalization_constant
 
     # 对每个样本的 response token loss 求和
     loss_sum_per_sequence = masked_loss.sum(dim=1)
@@ -292,6 +307,11 @@ def grpo_train_step(
     normalization_constant: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
 
+    if importance_reweighting_method != "none":
+        raise NotImplementedError(
+            "grpo_train_step currently supports on-policy training only"
+        )
+
     # 清空上一轮反向传播的梯度，切换成训练模式
     optimizer.zero_grad(set_to_none=True)
     model.train()
@@ -323,6 +343,26 @@ def grpo_train_step(
     labels = tokenized["labels"]
     response_mask = tokenized["response_mask"]
 
+    batch_size = len(rollout_responses)
+    if batch_size == 0:
+        raise ValueError("rollout_responses must not be empty")
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    if batch_size % gradient_accumulation_steps != 0:
+        raise ValueError(
+            "batch_size must be divisible by gradient_accumulation_steps"
+        )
+
+    # Zero-advantage samples have zero gradient. Prune them before the model
+    # forward pass, while keeping the original batch size for normalization.
+    active_indices = torch.nonzero(advantages != 0, as_tuple=True)[0]
+    active_batch_size = active_indices.numel()
+    if active_batch_size < batch_size:
+        input_ids = input_ids.index_select(0, active_indices)
+        labels = labels.index_select(0, active_indices)
+        response_mask = response_mask.index_select(0, active_indices)
+        advantages = advantages.index_select(0, active_indices)
+
     # Tokenization and reward computation happen on CPU, while the policy is
     # normally on GPU. Move every tensor used by the forward pass together.
     device = next(model.parameters()).device
@@ -331,15 +371,14 @@ def grpo_train_step(
     response_mask = response_mask.to(device)
     advantages = advantages.to(device)
 
-    batch_size = len(rollout_responses)
     microbatch_size = batch_size // gradient_accumulation_steps
 
     total_loss = 0.0
     entropy_sum = 0.0
     entropy_count = 0.0
 
-    for start in range(0, batch_size, microbatch_size):
-        end = start + microbatch_size
+    for start in range(0, active_batch_size, microbatch_size):
+        end = min(start + microbatch_size, active_batch_size)
 
         input_ids_micro = input_ids[start:end]
         labels_micro = labels[start:end]
@@ -361,20 +400,26 @@ def grpo_train_step(
         per_token_loss, loss_metadata = compute_policy_gradient_loss(
             raw_rewards_or_advantages=advantages_micro,
             policy_log_probs=policy_log_probs,
-            importance_reweighting_method="none",
+            importance_reweighting_method=importance_reweighting_method,
         )
 
-        # 用 response_mask 把 token loss 转换成 sequence norm 之后的 loss
+        # 用 response_mask 聚合 token loss。
         microbatch_loss = aggregate_loss_across_microbatch(
             per_token_policy_gradient_loss=per_token_loss,
             mask=mask_micro,
-            loss_normalization="sequence",
+            loss_normalization=loss_normalization,
+            normalization_constant=normalization_constant,
         )
 
-        # 计算 microbatch 占完整 batch 的比例
-        weight = (end - start) / batch_size
-        # 把当前 microbatch 的平均 loss 按样本比例缩放。
-        scaled_loss = microbatch_loss * weight
+        if loss_normalization == "sequence":
+            # The sequence-normalized microbatch loss is a mean over its
+            # active sequences, so recover the full-batch mean here.
+            weight = (end - start) / batch_size
+            scaled_loss = microbatch_loss * weight
+        else:
+            # Constant normalization already uses the global denominator;
+            # microbatch losses should simply add up.
+            scaled_loss = microbatch_loss
 
         # 执行反向传播，梯度会积累到 .grad 里面
         scaled_loss.backward()
@@ -392,7 +437,7 @@ def grpo_train_step(
         entropy_count += mask_float.sum().detach().item()
 
     # 梯度裁剪
-    if max_grad_norm is not None:
+    if max_grad_norm is not None and active_batch_size > 0:
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(),
             max_grad_norm,
@@ -404,7 +449,7 @@ def grpo_train_step(
 
     optimizer.step()
 
-        # 12. 清空梯度，为下一次更新准备
+    # 清空梯度，为下一次更新准备
     optimizer.zero_grad(set_to_none=True)
 
     metadata = {
