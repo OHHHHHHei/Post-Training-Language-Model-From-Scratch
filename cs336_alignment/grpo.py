@@ -13,7 +13,7 @@ def tokenize_prompt_and_output(
     if len(prompt_strs) != len(output_strs):
         raise ValueError("prompt_strs and output_strs must have the same length")
 
-    # Tokenize prompts and responses separately, then concatenate their IDs.
+    # 分别对提示词和回答进行分词，然后拼接它们的 ID。
     prompt_tokenized = tokenizer(
         prompt_strs,
         add_special_tokens=False
@@ -30,7 +30,7 @@ def tokenize_prompt_and_output(
         for prompt_id, output_id in zip(prompt_ids, output_ids)
     ]
 
-    # Pad the concatenated sequences to a common length.
+    # 将拼接后的序列填充到统一长度。
     tokenized = tokenizer.pad(
         {"input_ids": full_ids},
         padding=True,
@@ -72,15 +72,15 @@ def get_response_log_probs(
     
     # 前向计算
     logits = model(input_ids).logits
-    # logits shape: [batch_size, sequence_length, vocab_size]
+    # logits 的形状为：[批次大小，序列长度，词表大小]
 
-    # 对词表维度做 log softmax
+    # 沿词表维度计算 log softmax
     all_log_probs = torch.log_softmax(logits, dim=-1)
 
-    # 取出 labels 对应 token 的 log probability
+    # 取出 labels 对应 token 的对数概率
     label_indices = labels.unsqueeze(-1)
 
-    # 得到取出真实 label 的概率
+    # 得到真实 label 对应的对数概率
     log_probs = torch.gather(
         all_log_probs,
         dim=-1,
@@ -92,8 +92,8 @@ def get_response_log_probs(
     }
 
     if return_token_entropy:
-        # Entropy is only used for logging. Compute it in small vocabulary
-        # chunks so we do not materialize another full [B, T, V] tensor.
+        # 熵只用于日志记录。按较小的词表分块计算，避免额外构造完整的
+        # [B, T, V] 张量。
         with torch.no_grad():
             token_entropy = torch.zeros(
                 all_log_probs.shape[:-1],
@@ -181,20 +181,20 @@ def compute_group_normalized_rewards(
     grouped_rewards = raw_rewards.reshape(-1, group_size)
 
     # 计算每个问题对应的一组 reward 的平均值
-    # shape: [num_groups, 1]
+    # 形状为：[num_groups, 1]
     group_means = grouped_rewards.mean(
         dim=1,
         keepdim=True,
     )
 
-    # baseline = mean subtracts the group mean; baseline = none keeps raw rewards.
+    # baseline = mean 时减去组内平均 reward；baseline = none 时保留原始 reward。
     if baseline == "mean":
         centered_rewards = grouped_rewards - group_means
     else:
         centered_rewards = grouped_rewards
 
     # 计算每组 reward 的标准差
-    # shape: [num_groups, 1]
+    # 形状为：[num_groups, 1]
     group_stds = grouped_rewards.std(
         dim=1,
         keepdim=True,
@@ -207,10 +207,10 @@ def compute_group_normalized_rewards(
     else:
         advantages = centered_rewards / (group_means + advantage_eps)
 
-    # 恢复成一维，方便后面的 policy-gradient loss 使用
+    # 恢复成一维，方便后面的策略梯度损失使用
     advantages = advantages.reshape(-1)
 
-    # metadata 只用于日志，不参与反向传播
+    # 元数据只用于日志，不参与反向传播
     metadata = {
         "mean_reward": raw_rewards.mean().item(),
         "mean_advantage": advantages.mean().item(),
@@ -228,18 +228,78 @@ def compute_policy_gradient_loss(
     response_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 
-
-    # raw_rewards_or_advantages:
+    # raw_rewards_or_advantages 的形状：
     # [batch_size] 或 [batch_size, 1]
     advantages = raw_rewards_or_advantages.reshape(-1, 1)
 
-    # policy_log_probs:
+    # policy_log_probs 的形状：
     # [batch_size, sequence_length]
-    per_token_policy_gradient_loss = (
-        -advantages * policy_log_probs
+    if policy_log_probs.ndim != 2:
+        raise ValueError("policy_log_probs must have shape (batch_size, sequence_length)")
+    if advantages.shape[0] != policy_log_probs.shape[0]:
+        raise ValueError("advantages and policy_log_probs batch sizes must match")
+
+    if importance_reweighting_method == "none":
+        per_token_policy_gradient_loss = -advantages * policy_log_probs
+        metadata = {}
+        return per_token_policy_gradient_loss, metadata
+
+    if importance_reweighting_method not in {"noclip", "grpo"}:
+        raise NotImplementedError(
+            f"Unsupported importance_reweighting_method: {importance_reweighting_method}"
+        )
+    if old_log_probs is None:
+        raise ValueError(
+            "old_log_probs is required for off-policy importance reweighting"
+        )
+    if old_log_probs.shape != policy_log_probs.shape:
+        raise ValueError("old_log_probs and policy_log_probs must have the same shape")
+
+    # 在对数空间中计算每个 token 的重要性比率。旧策略保持不变，不能接收梯度。
+    log_ratio = policy_log_probs - old_log_probs.detach()
+    importance_ratio = torch.exp(log_ratio)
+
+    if importance_reweighting_method == "noclip":
+        # 代理目标函数为 A * w_t。梯度下降需要最小化它的相反数，
+        # 因此每个 token 的损失为 -A * w_t。
+        per_token_policy_gradient_loss = -advantages * importance_ratio
+        metadata = {}
+        return per_token_policy_gradient_loss, metadata
+
+    if cliprange is None:
+        raise ValueError("cliprange is required for GRPO clipping")
+    if cliprange < 0:
+        raise ValueError("cliprange must be non-negative")
+
+    clipped_ratio = torch.clamp(
+        importance_ratio,
+        min=1.0 - cliprange,
+        max=1.0 + cliprange,
+    )
+    unclipped_objective = advantages * importance_ratio
+    clipped_objective = advantages * clipped_ratio
+    per_token_policy_gradient_loss = -torch.minimum(
+        unclipped_objective,
+        clipped_objective,
     )
 
-    metadata = {}
+    # 统计 PPO/GRPO 目标函数选择裁剪分支的 token 比例。
+    clipped_tokens = (
+        ((advantages > 0) & (importance_ratio > 1.0 + cliprange))
+        | ((advantages < 0) & (importance_ratio < 1.0 - cliprange))
+    )
+    if response_mask is None:
+        clip_fraction = clipped_tokens.to(dtype=policy_log_probs.dtype).mean()
+    else:
+        mask = response_mask.to(
+            device=policy_log_probs.device,
+            dtype=policy_log_probs.dtype,
+        )
+        clip_fraction = (
+            clipped_tokens.to(dtype=policy_log_probs.dtype) * mask
+        ).sum() / mask.sum().clamp_min(1.0)
+
+    metadata = {"clip_fraction": clip_fraction.detach()}
 
     return per_token_policy_gradient_loss, metadata
 
@@ -255,10 +315,10 @@ def aggregate_loss_across_microbatch(
             f"Unsupported loss_normalization: {loss_normalization}"
         )
 
-    # 将 mask 转换成和 loss 一样的数据类型
+    # 将 mask 转换成和损失一样的数据类型
     mask = mask.to(dtype=per_token_policy_gradient_loss.dtype)
 
-    # 只保留 response token 的 loss
+    # 只保留回答部分 token 的损失
     masked_loss = per_token_policy_gradient_loss * mask
 
     if loss_normalization == "constant":
@@ -270,18 +330,19 @@ def aggregate_loss_across_microbatch(
             raise ValueError("normalization_constant must be positive")
         return masked_loss.sum() / normalization_constant
 
-    # 对每个样本的 response token loss 求和
+    # 对每个样本的回答部分 token 损失求和
     loss_sum_per_sequence = masked_loss.sum(dim=1)
 
-    # 统计每个样本有多少个 response token
+    # 统计每个样本有多少个回答部分 token
     response_token_count = mask.sum(dim=1).clamp_min(1.0)
 
-    # 每个样本内部，对 response token 求平均,sequence normalization,防止 loss 受到长度影响
+    # 对每个样本内部的回答部分 token 求平均，执行序列归一化，
+    # 防止损失受到回答长度影响。
     loss_per_sequence = (
         loss_sum_per_sequence / response_token_count
     )
 
-    # 再对 batch 中所有样本求平均
+    # 再对批次中的所有样本求平均
     loss = loss_per_sequence.mean()
 
     return loss
@@ -312,18 +373,18 @@ def grpo_train_step(
             "grpo_train_step currently supports on-policy training only"
         )
 
-    # 清空上一轮反向传播的梯度，切换成训练模式
+    # 清空上一轮反向传播的梯度，并切换到训练模式
     optimizer.zero_grad(set_to_none=True)
     model.train()
 
-    # 计算所有 rollout 的 rewards
+    # 计算所有 rollout 的 reward
     raw_rewards, reward_metadata = compute_rollout_rewards(
         reward_fn=reward_fn,
         rollout_responses=rollout_responses,
         repeated_ground_truths=repeated_ground_truths,
     )
 
-    # 在完整 batch 上计算 advantages
+    # 在完整批次上计算 advantage
     advantages, advantages_metadata = compute_group_normalized_rewards(
         raw_rewards=raw_rewards,
         group_size=group_size,
@@ -332,7 +393,7 @@ def grpo_train_step(
         advantage_normalizer=advantage_normalizer,
     )
 
-    # 对完整 batch 做 tokenize
+    # 对完整批次进行分词
     tokenized = tokenize_prompt_and_output(
         prompt_strs=repeated_prompts,
         output_strs=rollout_responses,
@@ -353,8 +414,8 @@ def grpo_train_step(
             "batch_size must be divisible by gradient_accumulation_steps"
         )
 
-    # Zero-advantage samples have zero gradient. Prune them before the model
-    # forward pass, while keeping the original batch size for normalization.
+    # advantage 为 0 的样本梯度也为 0。在模型前向计算前将它们过滤掉，
+    # 但归一化时仍保留原始批次大小。
     active_indices = torch.nonzero(advantages != 0, as_tuple=True)[0]
     active_batch_size = active_indices.numel()
     if active_batch_size < batch_size:
@@ -363,8 +424,8 @@ def grpo_train_step(
         response_mask = response_mask.index_select(0, active_indices)
         advantages = advantages.index_select(0, active_indices)
 
-    # Tokenization and reward computation happen on CPU, while the policy is
-    # normally on GPU. Move every tensor used by the forward pass together.
+    # 分词和 reward 计算在 CPU 上完成，策略模型通常在 GPU 上运行。
+    # 将前向计算所需的所有张量一起移动到模型所在设备。
     device = next(model.parameters()).device
     input_ids = input_ids.to(device)
     labels = labels.to(device)
@@ -385,7 +446,7 @@ def grpo_train_step(
         mask_micro = response_mask[start:end]
         advantages_micro = advantages[start:end]
 
-        # 当前 policy 对这些 output 的 log probability
+        # 当前策略对这些输出的对数概率
         log_prob_output = get_response_log_probs(
             model=model,
             input_ids=input_ids_micro,
@@ -396,14 +457,14 @@ def grpo_train_step(
         policy_log_probs = log_prob_output["log_probs"]
         token_entropy = log_prob_output["token_entropy"]
 
-        # 计算每个 token 的 policy_gradient loss
+        # 计算每个 token 的策略梯度损失
         per_token_loss, loss_metadata = compute_policy_gradient_loss(
             raw_rewards_or_advantages=advantages_micro,
             policy_log_probs=policy_log_probs,
             importance_reweighting_method=importance_reweighting_method,
         )
 
-        # 用 response_mask 聚合 token loss。
+        # 使用 response_mask 聚合 token 损失。
         microbatch_loss = aggregate_loss_across_microbatch(
             per_token_policy_gradient_loss=per_token_loss,
             mask=mask_micro,
@@ -412,19 +473,19 @@ def grpo_train_step(
         )
 
         if loss_normalization == "sequence":
-            # The sequence-normalized microbatch loss is a mean over its
-            # active sequences, so recover the full-batch mean here.
+            # 序列归一化后的 microbatch 损失是当前有效样本的平均值，
+            # 因此需要在这里恢复成完整批次的平均值。
             weight = (end - start) / batch_size
             scaled_loss = microbatch_loss * weight
         else:
-            # Constant normalization already uses the global denominator;
-            # microbatch losses should simply add up.
+            # 常数归一化已经使用全局分母，因此各个 microbatch
+            # 的损失直接相加即可。
             scaled_loss = microbatch_loss
 
-        # 执行反向传播，梯度会积累到 .grad 里面
+        # 执行反向传播，梯度会累积到 .grad 中
         scaled_loss.backward()
 
-        # 记录 loss
+        # 记录损失
         total_loss += scaled_loss.detach().item()
 
         mask_float = mask_micro.to(

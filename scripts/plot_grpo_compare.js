@@ -19,14 +19,30 @@ function readRun(inputPath) {
     .filter(Boolean)
     .map((line) => JSON.parse(line));
   const match = path.basename(inputPath).match(/metrics_seed(.+)\.jsonl$/);
+  const variant = rows.find((row) => row.variant)?.variant;
+  const directoryVariant = path.basename(path.dirname(inputPath)) === "grpo_standard"
+    ? "standard"
+    : undefined;
+  const identifiedVariant = variant || directoryVariant;
+  const variantLabels = {
+    standard: "Standard GRPO",
+    grpo_constant: "GRPO constant",
+    dr_grpo: "Dr. GRPO",
+    rft: "RFT",
+    maxrl: "MaxRL",
+  };
+  const label = identifiedVariant
+    ? variantLabels[identifiedVariant] || identifiedVariant
+    : `seed ${match ? match[1] : path.basename(inputPath)}`;
   return {
     seed: match ? match[1] : path.basename(inputPath),
+    key: identifiedVariant ? `variant-${identifiedVariant}` : `seed-${match ? match[1] : path.basename(inputPath)}`,
+    label,
     data: rows,
   };
 }
 
 const runs = inputPaths.map(readRun);
-const seedTitle = runs.map((run) => "seed " + run.seed).join(" + ");
 const serializedRuns = JSON.stringify(runs);
 
 const html = String.raw`<div id="grpo-seed42-666-curves">
@@ -182,8 +198,8 @@ const html = String.raw`<div id="grpo-seed42-666-curves">
     }
   </style>
   <div class="heading">
-    <h1>GRPO standard on-policy: ${seedTitle}</h1>
-    <p class="subtitle">200 rollout steps · validation evaluated every 10 steps</p>
+    <h1>On-policy GRPO variants on GSM8K (seed 42)</h1>
+    <p class="subtitle">200 rollout steps · validation every 10 steps · click legend items to toggle methods</p>
   </div>
   <div class="legend" aria-label="Runs"></div>
   <div class="plots"></div>
@@ -219,7 +235,7 @@ const html = String.raw`<div id="grpo-seed42-666-curves">
     { id: "entropy", title: "Token entropy", yLabel: "entropy", metrics: [{ field: "token_entropy", label: "train", points: false }] },
     { id: "length", title: "Validation response length", yLabel: "tokens", metrics: [{ field: "val_avg_response_length", label: "validation", dash: "5 3", points: true }] }
   ];
-  const enabledRuns = new Set(runs.map((run) => run.seed));
+  const enabledRuns = new Set(runs.map((run) => run.key));
   const tooltip = d3.select(root).select(".tooltip");
 
   const legend = d3.select(root).select(".legend");
@@ -229,15 +245,15 @@ const html = String.raw`<div id="grpo-seed42-666-curves">
     .attr("type", "button")
     .attr("aria-pressed", "true")
     .on("click", function(event, run) {
-      if (enabledRuns.has(run.seed)) enabledRuns.delete(run.seed);
-      else enabledRuns.add(run.seed);
-      d3.select(this).attr("aria-pressed", enabledRuns.has(run.seed) ? "true" : "false");
+      if (enabledRuns.has(run.key)) enabledRuns.delete(run.key);
+      else enabledRuns.add(run.key);
+      d3.select(this).attr("aria-pressed", enabledRuns.has(run.key) ? "true" : "false");
       drawAll();
     })
     .each(function(run, index) {
       const button = d3.select(this);
       button.append("span").attr("class", "swatch").style("color", colors[index % colors.length]);
-      button.append("span").text("seed " + run.seed);
+      button.append("span").text(run.label);
     });
   legend.append("span").attr("class", "legend-note").text("solid = train · dashed with points = validation");
 
@@ -336,7 +352,7 @@ const html = String.raw`<div id="grpo-seed42-666-curves">
       .defined((row) => Number.isFinite(Number(row.value)))
       .x((row) => x(row.step))
       .y((row) => y(row.value));
-    runs.filter((run) => enabledRuns.has(run.seed)).forEach((run, runIndex) => {
+    runs.filter((run) => enabledRuns.has(run.key)).forEach((run, runIndex) => {
       const color = colors[runIndex % colors.length];
       panel.metrics.forEach((metric) => {
         const points = pointsFor(run, metric.field)
@@ -345,7 +361,7 @@ const html = String.raw`<div id="grpo-seed42-666-curves">
         chart.append("path")
           .datum(points)
           .attr("class", "series-line")
-          .attr("data-series", run.seed + "-" + metric.field)
+          .attr("data-series", run.key + "-" + metric.field)
           .attr("stroke", color)
           .attr("stroke-dasharray", metric.dash || null)
           .attr("d", line);
@@ -354,7 +370,7 @@ const html = String.raw`<div id="grpo-seed42-666-curves">
             .data(points)
             .join("circle")
             .attr("class", "series-point point-" + runIndex + "-" + metric.field.replaceAll("_", "-"))
-            .attr("data-series", run.seed + "-" + metric.field)
+            .attr("data-series", run.key + "-" + metric.field)
             .attr("cx", (row) => x(row.step))
             .attr("cy", (row) => y(row.value))
             .attr("r", 3)
@@ -381,12 +397,12 @@ const html = String.raw`<div id="grpo-seed42-666-curves">
       .on("pointermove", function(event) {
         const pointer = d3.pointer(event, this);
         const step = x.invert(pointer[0]);
-        const rows = runs.filter((run) => enabledRuns.has(run.seed)).flatMap((run, runIndex) =>
+        const rows = runs.filter((run) => enabledRuns.has(run.key)).flatMap((run, runIndex) =>
           panel.metrics.map((metric) => {
             const value = interpolate(pointsFor(run, metric.field), step, metric.field);
             return value == null ? null : {
               color: colors[runIndex % colors.length],
-              label: "seed " + run.seed + " · " + metric.label,
+              label: run.label + " · " + metric.label,
               value,
             };
           })

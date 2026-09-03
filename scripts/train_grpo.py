@@ -1,4 +1,4 @@
-"""Minimal standard on-policy GRPO training script for GSM8K."""
+"""Minimal on-policy GRPO training script for GSM8K."""
 
 import json
 import os
@@ -18,7 +18,6 @@ MODEL_ID = "allenai/OLMo-2-0425-1B"
 PROMPT_PATH = "cs336_alignment/prompts/r1_zero.prompt"
 TRAIN_PATH = "data/gsm8k/train.jsonl"
 VAL_PATH = "data/gsm8k/test.jsonl"
-OUTPUT_DIR = Path("experiments/grpo_standard")
 
 N_TRAIN_EXAMPLES = 6400
 N_VAL_EXAMPLES = 1024
@@ -34,6 +33,55 @@ MAX_TOKENS = 512
 MAX_GRAD_NORM = 1.0
 EVAL_EVERY = 10
 SEED = int(os.environ.get("GRPO_SEED", "42"))
+
+# Fixed denominator for the constant-normalized variants.
+NORMALIZATION_CONSTANT = int(
+    os.environ.get(
+        "GRPO_NORMALIZATION_CONSTANT",
+        str(ROLLOUT_BATCH_SIZE * MAX_TOKENS),
+    )
+)
+
+VARIANT = os.environ.get("GRPO_VARIANT", "standard")
+VARIANT_CONFIGS = {
+    "standard": {
+        "baseline": "mean",
+        "advantage_normalizer": "std",
+        "loss_normalization": "sequence",
+        "normalization_constant": None,
+    },
+    "grpo_constant": {
+        "baseline": "mean",
+        "advantage_normalizer": "std",
+        "loss_normalization": "constant",
+        "normalization_constant": NORMALIZATION_CONSTANT,
+    },
+    "dr_grpo": {
+        "baseline": "mean",
+        "advantage_normalizer": "none",
+        "loss_normalization": "constant",
+        "normalization_constant": NORMALIZATION_CONSTANT,
+    },
+    "rft": {
+        "baseline": "none",
+        "advantage_normalizer": "none",
+        "loss_normalization": "constant",
+        "normalization_constant": NORMALIZATION_CONSTANT,
+    },
+    "maxrl": {
+        "baseline": "mean",
+        "advantage_normalizer": "mean",
+        "loss_normalization": "constant",
+        "normalization_constant": NORMALIZATION_CONSTANT,
+    },
+}
+if VARIANT not in VARIANT_CONFIGS:
+    raise ValueError(f"Unsupported GRPO_VARIANT: {VARIANT}")
+VARIANT_CONFIG = VARIANT_CONFIGS[VARIANT]
+
+OUTPUT_DIR = Path(
+    os.environ.get("GRPO_OUTPUT_DIR", f"experiments/grpo_{VARIANT}")
+)
 
 POLICY_DEVICE = "cuda:0"
 VLLM_GPU = 2
@@ -137,6 +185,31 @@ def main():
     server.start()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    with (OUTPUT_DIR / f"config_seed{SEED}.json").open(
+        "w", encoding="utf-8"
+    ) as config_file:
+        json.dump(
+            {
+                "variant": VARIANT,
+                "seed": SEED,
+                "model_id": MODEL_ID,
+                "prompt_path": PROMPT_PATH,
+                "n_train_examples": N_TRAIN_EXAMPLES,
+                "n_val_examples": N_VAL_EXAMPLES,
+                "num_rollout_steps": NUM_ROLLOUT_STEPS,
+                "rollout_batch_size": ROLLOUT_BATCH_SIZE,
+                "group_size": GROUP_SIZE,
+                "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
+                "learning_rate": LEARNING_RATE,
+                "temperature": TEMPERATURE,
+                "max_tokens": MAX_TOKENS,
+                "max_grad_norm": MAX_GRAD_NORM,
+                "eval_every": EVAL_EVERY,
+                "variant_config": VARIANT_CONFIG,
+            },
+            config_file,
+            indent=2,
+        )
     metrics_file = (OUTPUT_DIR / f"metrics_seed{SEED}.jsonl").open(
         "w", encoding="utf-8"
     )
@@ -188,13 +261,16 @@ def main():
                 rollout_responses=responses,
                 repeated_ground_truths=repeated_answers,
                 group_size=GROUP_SIZE,
-                baseline="mean",
-                advantage_normalizer="std",
+                **VARIANT_CONFIG,
                 importance_reweighting_method="none",
-                loss_normalization="sequence",
             )
 
-            metrics = {"step": step + 1, **train_metrics}
+            metrics = {
+                "step": step + 1,
+                "variant": VARIANT,
+                "seed": SEED,
+                **train_metrics,
+            }
             if (step + 1) % EVAL_EVERY == 0:
                 server.sync_policy_weights(policy)
                 metrics.update(
