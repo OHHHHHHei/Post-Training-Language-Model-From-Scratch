@@ -1,0 +1,1 @@
+{"step": 1, "variant": "offpolicy_naive", "seed": 42, "mean_reward": 0.0, "mean_format_reward": 0.51953125, "mean_answer_reward": 0.0, "mean_advantage": 0.0, "mean_group_std": 0.0, "loss": 0.0, "grad_norm": 0.0, "token_entropy": 0.0}

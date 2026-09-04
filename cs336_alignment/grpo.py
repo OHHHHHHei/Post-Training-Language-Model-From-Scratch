@@ -244,7 +244,7 @@ def compute_policy_gradient_loss(
         metadata = {}
         return per_token_policy_gradient_loss, metadata
 
-    if importance_reweighting_method not in {"noclip", "grpo"}:
+    if importance_reweighting_method not in {"noclip", "grpo", "gspo"}:
         raise NotImplementedError(
             f"Unsupported importance_reweighting_method: {importance_reweighting_method}"
         )
@@ -257,6 +257,61 @@ def compute_policy_gradient_loss(
 
     # 在对数空间中计算每个 token 的重要性比率。旧策略保持不变，不能接收梯度。
     log_ratio = policy_log_probs - old_log_probs.detach()
+
+    if importance_reweighting_method == "gspo":
+        if response_mask is None:
+            raise ValueError("response_mask is required for GSPO")
+        if response_mask.shape != policy_log_probs.shape:
+            raise ValueError(
+                "response_mask and policy_log_probs must have the same shape"
+            )
+        if cliprange is None:
+            raise ValueError("cliprange is required for GSPO clipping")
+        if cliprange < 0:
+            raise ValueError("cliprange must be non-negative")
+
+        # GSPO 在回答 token 上平均 log-ratio，再取指数得到几何平均权重。
+        # 这样避免了直接连乘 token-level 权重造成的数值不稳定。
+        mask = response_mask.to(
+            device=policy_log_probs.device,
+            dtype=policy_log_probs.dtype,
+        )
+        response_token_count = mask.sum(dim=1).clamp_min(1.0)
+        sequence_log_ratio = (
+            (log_ratio * mask).sum(dim=1) / response_token_count
+        )
+        sequence_ratio = torch.exp(sequence_log_ratio)
+
+        sequence_advantages = advantages.squeeze(1)
+        clipped_sequence_ratio = torch.clamp(
+            sequence_ratio,
+            min=1.0 - cliprange,
+            max=1.0 + cliprange,
+        )
+        unclipped_objective = sequence_advantages * sequence_ratio
+        clipped_objective = sequence_advantages * clipped_sequence_ratio
+        sequence_loss = -torch.minimum(
+            unclipped_objective,
+            clipped_objective,
+        )
+
+        # 后续聚合函数仍以 token-level 张量为接口，因此将同一个
+        # sequence-level loss 广播到该序列的所有位置。
+        per_token_policy_gradient_loss = sequence_loss.unsqueeze(1).expand_as(
+            policy_log_probs
+        )
+
+        clipped_sequences = (
+            ((sequence_advantages > 0) & (sequence_ratio > 1.0 + cliprange))
+            | ((sequence_advantages < 0) & (sequence_ratio < 1.0 - cliprange))
+        )
+        metadata = {
+            "clip_fraction": clipped_sequences.to(
+                dtype=policy_log_probs.dtype
+            ).mean().detach()
+        }
+        return per_token_policy_gradient_loss, metadata
+
     importance_ratio = torch.exp(log_ratio)
 
     if importance_reweighting_method == "noclip":
@@ -368,11 +423,6 @@ def grpo_train_step(
     normalization_constant: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
 
-    if importance_reweighting_method != "none":
-        raise NotImplementedError(
-            "grpo_train_step currently supports on-policy training only"
-        )
-
     # 清空上一轮反向传播的梯度，并切换到训练模式
     optimizer.zero_grad(set_to_none=True)
     model.train()
@@ -423,6 +473,11 @@ def grpo_train_step(
         labels = labels.index_select(0, active_indices)
         response_mask = response_mask.index_select(0, active_indices)
         advantages = advantages.index_select(0, active_indices)
+        if old_log_probs is not None:
+            old_log_probs = old_log_probs.index_select(
+                0,
+                active_indices.to(old_log_probs.device),
+            )
 
     # 分词和 reward 计算在 CPU 上完成，策略模型通常在 GPU 上运行。
     # 将前向计算所需的所有张量一起移动到模型所在设备。
@@ -431,12 +486,16 @@ def grpo_train_step(
     labels = labels.to(device)
     response_mask = response_mask.to(device)
     advantages = advantages.to(device)
+    if old_log_probs is not None:
+        old_log_probs = old_log_probs.to(device)
 
     microbatch_size = batch_size // gradient_accumulation_steps
 
     total_loss = 0.0
     entropy_sum = 0.0
     entropy_count = 0.0
+    clip_fraction_sum = 0.0
+    clip_fraction_count = 0
 
     for start in range(0, active_batch_size, microbatch_size):
         end = min(start + microbatch_size, active_batch_size)
@@ -445,6 +504,9 @@ def grpo_train_step(
         labels_micro = labels[start:end]
         mask_micro = response_mask[start:end]
         advantages_micro = advantages[start:end]
+        old_log_probs_micro = (
+            None if old_log_probs is None else old_log_probs[start:end]
+        )
 
         # 当前策略对这些输出的对数概率
         log_prob_output = get_response_log_probs(
@@ -462,7 +524,17 @@ def grpo_train_step(
             raw_rewards_or_advantages=advantages_micro,
             policy_log_probs=policy_log_probs,
             importance_reweighting_method=importance_reweighting_method,
+            old_log_probs=old_log_probs_micro,
+            cliprange=cliprange,
+            response_mask=mask_micro,
         )
+
+        if "clip_fraction" in loss_metadata:
+            clip_fraction_sum += (
+                loss_metadata["clip_fraction"].detach().item()
+                * (end - start)
+            )
+            clip_fraction_count += end - start
 
         # 使用 response_mask 聚合 token 损失。
         microbatch_loss = aggregate_loss_across_microbatch(
@@ -520,6 +592,10 @@ def grpo_train_step(
         "grad_norm": grad_norm_value,
         "token_entropy": entropy_sum / max(entropy_count, 1.0),
     }
+    if clip_fraction_count > 0:
+        metadata["clip_fraction"] = (
+            clip_fraction_sum / clip_fraction_count
+        )
 
     return torch.tensor(total_loss), metadata
 

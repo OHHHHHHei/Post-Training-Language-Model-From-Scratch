@@ -1,4 +1,4 @@
-"""Minimal on-policy GRPO training script for GSM8K."""
+"""在 GSM8K 上训练 GRPO 的简化脚本。"""
 
 import json
 import os
@@ -9,11 +9,15 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-from cs336_alignment.grpo import grpo_train_step
+from cs336_alignment.grpo import (
+    get_response_log_probs,
+    grpo_train_step,
+    tokenize_prompt_and_output,
+)
 from cs336_alignment.vllm_utils import VLLMServer
 
 
-# Change these values for different runs.
+# 根据实验需要修改这些配置。
 MODEL_ID = "allenai/OLMo-2-0425-1B"
 PROMPT_PATH = "cs336_alignment/prompts/r1_zero.prompt"
 TRAIN_PATH = "data/gsm8k/train.jsonl"
@@ -24,8 +28,18 @@ N_VAL_EXAMPLES = 1024
 NUM_ROLLOUT_STEPS = int(os.environ.get("GRPO_STEPS", "50"))
 ROLLOUT_BATCH_SIZE = 256
 GROUP_SIZE = 8
+VARIANT = os.environ.get("GRPO_VARIANT", "standard")
+OFF_POLICY_METHODS = {
+    "offpolicy_naive": "none",
+    "offpolicy_noclip": "noclip",
+    "offpolicy_clip": "grpo",
+    "offpolicy_gspo": "gspo",
+}
 GRADIENT_ACCUMULATION_STEPS = int(
-    os.environ.get("GRPO_GRAD_ACCUM", "64")
+    os.environ.get(
+        "GRPO_GRAD_ACCUM",
+        "2" if VARIANT in OFF_POLICY_METHODS else "64",
+    )
 )
 LEARNING_RATE = 1e-5
 TEMPERATURE = 1.0
@@ -34,7 +48,7 @@ MAX_GRAD_NORM = 1.0
 EVAL_EVERY = 10
 SEED = int(os.environ.get("GRPO_SEED", "42"))
 
-# Fixed denominator for the constant-normalized variants.
+# 常数归一化变体使用固定分母。
 NORMALIZATION_CONSTANT = int(
     os.environ.get(
         "GRPO_NORMALIZATION_CONSTANT",
@@ -42,7 +56,6 @@ NORMALIZATION_CONSTANT = int(
     )
 )
 
-VARIANT = os.environ.get("GRPO_VARIANT", "standard")
 VARIANT_CONFIGS = {
     "standard": {
         "baseline": "mean",
@@ -75,9 +88,29 @@ VARIANT_CONFIGS = {
         "normalization_constant": NORMALIZATION_CONSTANT,
     },
 }
-if VARIANT not in VARIANT_CONFIGS:
-    raise ValueError(f"Unsupported GRPO_VARIANT: {VARIANT}")
-VARIANT_CONFIG = VARIANT_CONFIGS[VARIANT]
+
+if VARIANT in OFF_POLICY_METHODS:
+    VARIANT_CONFIG = {
+        "baseline": "mean",
+        "advantage_normalizer": "std",
+        "loss_normalization": "sequence",
+        "normalization_constant": None,
+        "importance_reweighting_method": OFF_POLICY_METHODS[VARIANT],
+        "cliprange": {
+            "offpolicy_clip": 0.2,
+            "offpolicy_gspo": 3e-4,
+        }.get(VARIANT),
+    }
+else:
+    VARIANT_CONFIG = {
+        **VARIANT_CONFIGS[VARIANT],
+        "importance_reweighting_method": "none",
+        "cliprange": None,
+    }
+
+IS_OFF_POLICY = VARIANT in OFF_POLICY_METHODS
+TRAIN_BATCH_SIZE = ROLLOUT_BATCH_SIZE // 32 if IS_OFF_POLICY else ROLLOUT_BATCH_SIZE
+NUM_TRAIN_UPDATES_PER_ROLLOUT = ROLLOUT_BATCH_SIZE // TRAIN_BATCH_SIZE
 
 OUTPUT_DIR = Path(
     os.environ.get("GRPO_OUTPUT_DIR", f"experiments/grpo_{VARIANT}")
@@ -118,6 +151,39 @@ def generate(server, prompts: list[str], seed: int, n: int = 1):
         batch_size=64,
     )
     return [completion.text for completion in completions]
+
+
+def compute_old_log_probs(
+    policy,
+    tokenizer,
+    prompts: list[str],
+    responses: list[str],
+):
+    """计算一组 rollout 在参数更新前的旧策略 log-prob。"""
+    tokenized = tokenize_prompt_and_output(
+        prompt_strs=prompts,
+        output_strs=responses,
+        tokenizer=tokenizer,
+    )
+    input_ids = tokenized["input_ids"].to(POLICY_DEVICE)
+    labels = tokenized["labels"].to(POLICY_DEVICE)
+
+    policy.eval()
+    with torch.no_grad():
+        log_prob_output = get_response_log_probs(
+            model=policy,
+            input_ids=input_ids,
+            labels=labels,
+        )
+    return log_prob_output["log_probs"].cpu()
+
+
+def average_metrics(metrics_list: list[dict[str, float]]) -> dict[str, float]:
+    """将同一批 rollout 的多次训练更新指标取平均。"""
+    return {
+        key: sum(metrics[key] for metrics in metrics_list) / len(metrics_list)
+        for key in metrics_list[0]
+    }
 
 
 def evaluate(
@@ -162,10 +228,12 @@ def main():
         attn_implementation="flash_attention_2",
     ).to(POLICY_DEVICE)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    # OLMo tokenizer 没有 pad token 时，使用 eos token 进行 batch padding。
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     policy.config.use_cache = False
 
+    # 优化器只更新训练模型，vLLM 通过权重同步获得最新参数。
     optimizer = torch.optim.AdamW(
         policy.parameters(),
         lr=LEARNING_RATE,
@@ -182,6 +250,7 @@ def main():
         logging_level="INFO",
         gpu_memory_utilization=0.8,
     )
+    # 启动 vLLM，后续用它批量生成 rollout。
     server.start()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -198,6 +267,8 @@ def main():
                 "n_val_examples": N_VAL_EXAMPLES,
                 "num_rollout_steps": NUM_ROLLOUT_STEPS,
                 "rollout_batch_size": ROLLOUT_BATCH_SIZE,
+                "train_batch_size": TRAIN_BATCH_SIZE,
+                "num_train_updates_per_rollout": NUM_TRAIN_UPDATES_PER_ROLLOUT,
                 "group_size": GROUP_SIZE,
                 "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
                 "learning_rate": LEARNING_RATE,
@@ -227,11 +298,11 @@ def main():
             repeated_prompts = [p for p in prompts for _ in range(GROUP_SIZE)]
             repeated_answers = [a for a in answers for _ in range(GROUP_SIZE)]
 
-            # Generate with the current policy.
+            # 每批 rollout 生成前，把当前训练模型的权重同步到 vLLM。
             server.sync_policy_weights(policy)
-            # Ask vLLM for GROUP_SIZE independent samples per prompt.
             responses = generate(server, prompts, SEED + step, n=GROUP_SIZE)
 
+            # 定期保存 rollout 样例，方便检查模型输出。
             if (step + 1) % 40 == 0:
                 for prompt, response, answer in zip(
                     repeated_prompts, responses, repeated_answers
@@ -250,20 +321,47 @@ def main():
                     )
                 rollouts_file.flush()
 
-            _, train_metrics = grpo_train_step(
-                model=policy,
-                tokenizer=tokenizer,
-                optimizer=optimizer,
-                gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-                max_grad_norm=MAX_GRAD_NORM,
-                reward_fn=r1_zero_reward_fn,
-                repeated_prompts=repeated_prompts,
-                rollout_responses=responses,
-                repeated_ground_truths=repeated_answers,
-                group_size=GROUP_SIZE,
-                **VARIANT_CONFIG,
-                importance_reweighting_method="none",
-            )
+            # 旧策略概率必须在第一次参数更新前固定下来。
+            old_log_probs_by_group = []
+            if VARIANT_CONFIG["importance_reweighting_method"] != "none":
+                for update_index in range(NUM_TRAIN_UPDATES_PER_ROLLOUT):
+                    start = update_index * TRAIN_BATCH_SIZE
+                    end = start + TRAIN_BATCH_SIZE
+                    old_log_probs_by_group.append(compute_old_log_probs(
+                        policy=policy,
+                        tokenizer=tokenizer,
+                        prompts=repeated_prompts[start:end],
+                        responses=responses[start:end],
+                    ))
+
+            # 在线策略时这里只有一次更新；离线策略时同一批 rollout
+            # 被拆成 32 个 group，连续进行 32 次参数更新。
+            update_metrics = []
+            for update_index in range(NUM_TRAIN_UPDATES_PER_ROLLOUT):
+                start = update_index * TRAIN_BATCH_SIZE
+                end = start + TRAIN_BATCH_SIZE
+                old_log_probs = (
+                    old_log_probs_by_group[update_index]
+                    if old_log_probs_by_group
+                    else None
+                )
+                _, metrics_for_update = grpo_train_step(
+                    model=policy,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+                    max_grad_norm=MAX_GRAD_NORM,
+                    reward_fn=r1_zero_reward_fn,
+                    repeated_prompts=repeated_prompts[start:end],
+                    rollout_responses=responses[start:end],
+                    repeated_ground_truths=repeated_answers[start:end],
+                    group_size=GROUP_SIZE,
+                    old_log_probs=old_log_probs,
+                    **VARIANT_CONFIG,
+                )
+                update_metrics.append(metrics_for_update)
+
+            train_metrics = average_metrics(update_metrics)
 
             metrics = {
                 "step": step + 1,
