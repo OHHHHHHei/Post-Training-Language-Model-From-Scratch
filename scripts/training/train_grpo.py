@@ -8,7 +8,10 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from post_training.gsm8k_grader import r1_zero_reward_fn
+from post_training.gsm8k_grader import (
+    question_only_reward_fn,
+    r1_zero_reward_fn,
+)
 from post_training.grpo import (
     get_response_log_probs,
     grpo_train_step,
@@ -19,7 +22,28 @@ from post_training.vllm_utils import VLLMServer
 
 # 根据实验需要修改这些配置。
 MODEL_ID = "allenai/OLMo-2-0425-1B"
-PROMPT_PATH = "post_training/prompts/gsm8k/r1_zero.prompt"
+PROMPT_CONFIGS = {
+    "r1_zero": {
+        "path": "post_training/prompts/gsm8k/r1_zero.prompt",
+        "reward_fn": r1_zero_reward_fn,
+        "stop": ["</answer>"],
+    },
+    "question_only": {
+        "path": "post_training/prompts/gsm8k/question_only.prompt",
+        "reward_fn": question_only_reward_fn,
+        "stop": None,
+    },
+    "three_shot": {
+        "path": "post_training/prompts/gsm8k/r1_zero_three_shot_gsm8k.prompt",
+        "reward_fn": r1_zero_reward_fn,
+        "stop": ["</answer>"],
+    },
+}
+PROMPT_NAME = os.environ.get("GRPO_PROMPT", "r1_zero")
+PROMPT_CONFIG = PROMPT_CONFIGS[PROMPT_NAME]
+PROMPT_PATH = PROMPT_CONFIG["path"]
+REWARD_FN = PROMPT_CONFIG["reward_fn"]
+STOP_STRINGS = PROMPT_CONFIG["stop"]
 TRAIN_PATH = "data/gsm8k/train.jsonl"
 VAL_PATH = "data/gsm8k/test.jsonl"
 
@@ -41,7 +65,7 @@ GRADIENT_ACCUMULATION_STEPS = int(
         "2" if VARIANT in OFF_POLICY_METHODS else "64",
     )
 )
-LEARNING_RATE = 1e-5
+LEARNING_RATE = float(os.environ.get("GRPO_LR", "1e-5"))
 TEMPERATURE = 1.0
 MAX_TOKENS = 512
 MAX_GRAD_NORM = 1.0
@@ -118,6 +142,8 @@ if IS_OFF_POLICY:
     )
 else:
     DEFAULT_OUTPUT_DIR = Path("experiments/on_policy") / VARIANT
+if PROMPT_NAME != "r1_zero":
+    DEFAULT_OUTPUT_DIR = Path("experiments/prompt_ablation") / PROMPT_NAME
 
 OUTPUT_DIR = Path(os.environ.get("GRPO_OUTPUT_DIR", str(DEFAULT_OUTPUT_DIR)))
 
@@ -143,16 +169,18 @@ def make_prompts(template: str, examples: list[dict[str, str]]):
 
 
 def generate(server, prompts: list[str], seed: int, n: int = 1):
+    sampling_params = {
+        "temperature": TEMPERATURE,
+        "max_tokens": MAX_TOKENS,
+        "n": n,
+        "seed": seed,
+    }
+    if STOP_STRINGS is not None:
+        sampling_params["stop"] = STOP_STRINGS
+        sampling_params["include_stop_str_in_output"] = True
     completions = server.generate_completions(
         prompts=prompts,
-        sampling_params={
-            "temperature": TEMPERATURE,
-            "max_tokens": MAX_TOKENS,
-            "n": n,
-            "seed": seed,
-            "stop": ["</answer>"],
-            "include_stop_str_in_output": True,
-        },
+        sampling_params=sampling_params,
         batch_size=64,
     )
     return [completion.text for completion in completions]
@@ -202,10 +230,7 @@ def evaluate(
 ):
     prompts, answers = make_prompts(template, examples)
     responses = generate(server, prompts, SEED + 10000 + step)
-    scores = [
-        r1_zero_reward_fn(response, answer)
-        for response, answer in zip(responses, answers)
-    ]
+    scores = [REWARD_FN(response, answer) for response, answer in zip(responses, answers)]
     response_tokenized = tokenizer(responses, add_special_tokens=False)
     average_response_length = sum(
         len(ids) for ids in response_tokenized["input_ids"]
@@ -269,6 +294,7 @@ def main():
                 "variant": VARIANT,
                 "seed": SEED,
                 "model_id": MODEL_ID,
+                "prompt_name": PROMPT_NAME,
                 "prompt_path": PROMPT_PATH,
                 "n_train_examples": N_TRAIN_EXAMPLES,
                 "n_val_examples": N_VAL_EXAMPLES,
@@ -358,7 +384,7 @@ def main():
                     optimizer=optimizer,
                     gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
                     max_grad_norm=MAX_GRAD_NORM,
-                    reward_fn=r1_zero_reward_fn,
+                    reward_fn=REWARD_FN,
                     repeated_prompts=repeated_prompts[start:end],
                     rollout_responses=responses[start:end],
                     repeated_ground_truths=repeated_answers[start:end],
