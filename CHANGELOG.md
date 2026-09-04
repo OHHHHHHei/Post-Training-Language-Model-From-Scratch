@@ -69,13 +69,13 @@ All changes we make to the assignment code or PDF will be documented in this fil
 - code: add Llama 3 tokenizer as a fixture.
 - code: fix DPO loss test
 - code: make SFT dataset test stricter by comparing against expected output to help folks catch bugs.
-- code: include prompts as text files in `cs336_alignment/prompts`
+- code: include prompts as text files in `post_training/prompts/gsm8k`
 - handout: fix typo in code example for writing AlpacaEval outputs.
 - handout: provide more instructions on interpreting AlpacaEval annotations file.
 - handout: give better default DPO hyperparameters
 - handout: clarify prompt to use for the DPO loss (AlpacaEval prompt) and mention EOS token
 - handout: clarify that arrows in the prompts are line continuations, not line breaks
-- handout: mention that we provide the prompts as text files at `cs336_alignment/prompts`
+- handout: mention that we provide the prompts as text files at `post_training/prompts/gsm8k`
 
 ### Fixed
 

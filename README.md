@@ -55,13 +55,13 @@ GSM8K 问题
 
 ### Prompting 与 rollout
 
-`scripts/prompting_baselines.py` 使用 vLLM 批量生成 GSM8K response，并调用
-`drgrpo_grader.py` 分别计算格式奖励和答案奖励。Prompt 模板支持 question-only、zero-shot
+`scripts/evaluation/prompting_baselines.py` 使用 vLLM 批量生成 GSM8K response，并调用
+`post_training/gsm8k_grader.py` 分别计算格式奖励和答案奖励。Prompt 模板支持 question-only、zero-shot
 R1-style 和 GSM8K three-shot 三种设置。
 
 ### Reward 与策略优化
 
-`cs336_alignment/grpo.py` 完成了以下组件：
+`post_training/grpo.py` 完成了以下组件：
 
 - 分别 tokenize prompt 和 response，并构造 response mask；
 - 计算 response token 的 log probabilities 和 entropy；
@@ -129,7 +129,7 @@ Standard GRPO 额外运行了四个随机种子，用于观察 RL 训练的 run-
 | 721 | 0.4512 | 0.9141 | 144.3 |
 | Mean +/- sample std | 0.3635 +/- 0.1933 | 0.9421 +/- 0.0395 | 118.6 +/- 73.1 |
 
-![On-policy GRPO 在 GSM8K 上的训练曲线](experiments/grpo_variants_seed42.png)
+![On-policy GRPO 在 GSM8K 上的训练曲线](experiments/figures/on_policy/variants_seed42.png)
 
 模型在训练早期快速提升输出格式合规率，答案奖励随后逐步提升。Standard GRPO 四个 seed 的平均 validation reward 为 0.3635，高于作业要求的 0.25。Seed 114514 的 reward 只有 0.0742，但格式 reward 达到 0.9990，同时 response length 降到 14.2，说明这次运行更偏向短格式输出。较大的 reward 和 response length 方差表明单个 seed 的曲线只能用于观察训练过程，方法之间的严格比较需要更多重复实验。
 
@@ -157,9 +157,9 @@ Off-policy 训练使用一个包含 256 条 response 的 rollout batch，并进�
 | `offpolicy_clip` | 0.4570 | 0.9004 | 114.4 | 0.0046 |
 | `offpolicy_gspo` | 0.5166 | 0.9844 | 156.4 | 0.1328 |
 
-![Off-policy GRPO 训练曲线](experiments/grpo_offpolicy_variants_seed42.png)
+![Off-policy GRPO 训练曲线](experiments/figures/off_policy/variants_seed42.png)
 
-![Off-policy 最终 Validation 指标](experiments/grpo_offpolicy_final_seed42.png)
+![Off-policy 最终 Validation 指标](experiments/figures/off_policy/final_seed42.png)
 
 在当前 seed 下，GSPO 达到最高 validation reward 和较高的格式 reward。Token-level clip 的 clip fraction 较低，但 response length 明显缩短。GSPO 的 clip fraction 为 0.1328，训练 gradient norm 低于 token-level clip 和 noclip，曲线中的极端波动也较少。Noclip 的 validation reward 和格式 reward 最低，说明固定 rollout 上进行多次更新时，只进行 token-level reweighting、缺少 clipping 会带来更明显的稳定性问题。off-policy 结果目前只有一个 seed，结论用于比较当前配置下的行为，不能直接推广到所有运行。
 
@@ -173,35 +173,43 @@ Off-policy 训练使用一个包含 256 条 response 的 rollout batch，并进�
 ## 仓库结构
 
 ```text
-cs336_alignment/
+post_training/
   grpo.py                    Tokenization、reward、loss 和 train step
-  drgrpo_grader.py           GSM8K reward function
-  prompts/                   Prompt 模板
+  gsm8k_grader.py            GSM8K reward function
+  prompts/gsm8k/             GSM8K Prompt 模板
+  prompts/safety/            Safety/RLHF Prompt 模板
   vllm_utils.py              vLLM 生命周期和权重同步
 scripts/
-  prompting_baselines.py     Prompting evaluation
-  train_grpo.py              On-policy 和 off-policy 训练循环
-  plot_grpo_variants.py      On-policy 曲线绘图
-  plot_offpolicy_variants.py Off-policy 曲线和最终指标绘图
-data/gsm8k/                  GSM8K 数据文件
-experiments/                 Metrics、rollout 样例、图片和日志
+  training/train_grpo.py     On-policy 和 off-policy 训练循环
+  evaluation/                Prompting 和 safety evaluation
+  plotting/                  训练曲线绘图脚本
+data/
+  gsm8k/                      GSM8K 数据文件
+  safety/                     可选 safety/RLHF 数据
+experiments/
+  on_policy/                  On-policy 训练结果
+  off_policy/                 Off-policy 训练结果和失败运行归档
+  figures/                    训练曲线和最终指标图
+  logs/                       训练日志
+docs/                         课程材料
 tests/                       单元测试和数值 snapshot
 ```
 
 主要图像文件：
 
-- `experiments/grpo_variants_seed42.png`：on-policy GRPO 变体曲线；
-- `experiments/grpo_offpolicy_variants_seed42.png`：off-policy 训练曲线；
-- `experiments/grpo_offpolicy_final_seed42.png`：off-policy 最终 validation 指标。
+- `experiments/figures/on_policy/variants_seed42.png`：on-policy GRPO 变体曲线；
+- `experiments/figures/off_policy/variants_seed42.png`：off-policy 训练曲线；
+- `experiments/figures/off_policy/final_seed42.png`：off-policy 最终 validation 指标。
 
 ## 快速开始
 
 项目使用 `uv` 管理环境：
 
 ```bash
-uv sync --no-install-package flash-attn
-uv sync
+uv sync --extra gpu --extra plots
 ```
+
+只运行 CPU 单元测试时可以使用 `uv sync`。
 
 运行 GRPO 测试：
 
@@ -214,20 +222,28 @@ uv run pytest tests/test_grpo.py
 训练脚本通过 `GRPO_VARIANT` 选择实验配置：
 
 ```bash
-GRPO_VARIANT=standard GRPO_SEED=42 GRPO_STEPS=200 uv run python scripts/train_grpo.py
+GRPO_VARIANT=standard GRPO_SEED=42 GRPO_STEPS=200 uv run python scripts/training/train_grpo.py
 ```
 
 运行 off-policy variant：
 
 ```bash
-GRPO_VARIANT=offpolicy_naive GRPO_SEED=42 GRPO_STEPS=200 uv run python scripts/train_grpo.py
+GRPO_VARIANT=offpolicy_naive GRPO_SEED=42 GRPO_STEPS=200 uv run python scripts/training/train_grpo.py
+```
+
+重新生成训练曲线：
+
+```bash
+python3 scripts/plotting/plot_grpo_variants.py
+python3 scripts/plotting/plot_offpolicy_variants.py
 ```
 
 默认硬件配置将策略模型放在逻辑设备 `cuda:0`，将 vLLM 放在物理 GPU 2。使用 `CUDA_VISIBLE_DEVICES` 可以指定策略模型使用的物理 GPU。
 
 ## 参考资料
 
-- [CS336 Assignment 5: Alignment](cs336_spring2026_assignment5_alignment.pdf)
+- [CS336 Assignment 5: Alignment](docs/assignment5_alignment.pdf)
+- [Assignment 5 Supplement: Safety and RLHF](docs/assignment5_supplement_safety_rlhf.pdf)
 - [GSM8K](https://github.com/openai/grade-school-math)
 - [OLMo 2](https://allenai.org/olmo)
 - [vLLM](https://github.com/vllm-project/vllm)

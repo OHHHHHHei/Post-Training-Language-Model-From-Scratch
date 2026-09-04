@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
-from cs336_alignment.grpo import (
+from post_training.grpo import (
     aggregate_loss_across_microbatch,
     compute_group_normalized_rewards,
     compute_rollout_rewards,
