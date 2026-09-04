@@ -51,7 +51,30 @@ GSM8K 问题
 
 训练代码通过 response mask 将 Prompt token 排除在策略损失之外。Padding token 不参与 loss 和 entropy 统计。Microbatch 降低单次前向计算的显存需求，梯度在逻辑训练 batch 内累积。
 
-## 核心实现与实验结果
+## 核心实现
+
+### Prompting 与 rollout
+
+`scripts/prompting_baselines.py` 使用 vLLM 批量生成 GSM8K response，并调用
+`drgrpo_grader.py` 分别计算格式奖励和答案奖励。Prompt 模板支持 question-only、zero-shot
+R1-style 和 GSM8K three-shot 三种设置。
+
+### Reward 与策略优化
+
+`cs336_alignment/grpo.py` 完成了以下组件：
+
+- 分别 tokenize prompt 和 response，并构造 response mask；
+- 计算 response token 的 log probabilities 和 entropy；
+- 计算 rollout reward、group-normalized advantage 和不同 advantage normalizer；
+- 实现 sequence/constant loss normalization 与 microbatch gradient accumulation；
+- 实现 standard GRPO、GRPO constant、Dr. GRPO、RFT 和 MaxRL。
+
+### Off-policy 更新
+
+训练脚本固定一批 rollout 的 old log probabilities，在同一批 response 上执行多次更新，支持
+token-level importance weighting、GRPO clipping 和 GSPO sequence-level geometric-mean weighting。
+
+## 实验结果
 
 ### Prompting Baseline
 
@@ -74,6 +97,16 @@ Prompting 实验在 1,319 条 GSM8K test 样本上比较三种 Prompt：
 | R1 zero-shot | 0 | 797 | 522 | 0 |
 | R1 three-shot | 219 | 1,054 | 46 | 0 |
 
+对应比例如下：
+
+| Prompt | Category 1 | Category 2 | Category 3 |
+| --- | ---: | ---: | ---: |
+| Question-only | 0.08% | 10.16% | 89.76% |
+| R1 zero-shot | 0.00% | 60.42% | 39.58% |
+| R1 three-shot | 16.60% | 79.91% | 3.49% |
+
+Question-only 几乎不会产生符合 grader 格式的有效答案。Zero-shot R1-style prompt 明显提高了格式遵循率，模型开始稳定输出推理和答案结构，但正确率仍为 0。Three-shot prompt 将格式合规率提高到 96.51%，正确率达到 16.60%，说明示例对输出格式和推理行为都有明显影响。
+
 ### On-policy GRPO 变体
 
 On-policy 实验使用 200 个 rollout steps，随机种子为 42，每 10 个 rollout steps 进行一次 validation。
@@ -86,9 +119,21 @@ On-policy 实验使用 200 个 rollout steps，随机种子为 42，每 10 个 r
 | RFT | 0.4219 | 0.9814 | 0.4219 | 129.8 |
 | MaxRL | 0.4453 | 0.9258 | 0.4453 | 141.6 |
 
+Standard GRPO 额外运行了四个随机种子，用于观察 RL 训练的 run-to-run variation：
+
+| Seed | Validation reward | Format reward | Response length |
+| ---: | ---: | ---: | ---: |
+| 42 | 0.4512 | 0.9170 | 131.4 |
+| 666 | 0.4775 | 0.9385 | 184.3 |
+| 114514 | 0.0742 | 0.9990 | 14.2 |
+| 721 | 0.4512 | 0.9141 | 144.3 |
+| Mean +/- sample std | 0.3635 +/- 0.1933 | 0.9421 +/- 0.0395 | 118.6 +/- 73.1 |
+
 ![On-policy GRPO 在 GSM8K 上的训练曲线](experiments/grpo_variants_seed42.png)
 
-曲线显示，模型在训练早期快速提升输出格式合规率。Answer reward 的提升速度较慢，训练过程存在明显波动。不同方法最终达到相近的 reward 区间，同时在 response length、entropy 和 gradient norm 上呈现不同的变化。四个随机种子的 Standard GRPO 结果保存在 `experiments/grpo_standard/` 中，可以观察到明显的 run-to-run variation。
+模型在训练早期快速提升输出格式合规率，答案奖励随后逐步提升。Standard GRPO 四个 seed 的平均 validation reward 为 0.3635，高于作业要求的 0.25。Seed 114514 的 reward 只有 0.0742，但格式 reward 达到 0.9990，同时 response length 降到 14.2，说明这次运行更偏向短格式输出。较大的 reward 和 response length 方差表明单个 seed 的曲线只能用于观察训练过程，方法之间的严格比较需要更多重复实验。
+
+在 seed 42 的变体对比中，GRPO constant 与 Standard GRPO 达到相同的 validation reward，同时格式 reward 更高、response 更短。Dr. GRPO 和 RFT 的最终 reward 略低，MaxRL 与 Standard GRPO 接近。constant normalization、advantage normalization 和 RFT 的差异会同时影响更新尺度与输出长度，当前结果用于展示趋势。
 
 ### Off-policy 实验
 
@@ -103,6 +148,28 @@ Off-policy 训练使用一个包含 256 条 response 的 rollout batch，并进�
 
 每个实验会在 `experiments/` 下保存配置、rollout 样例、训练指标和终端日志。指标包含 reward、format reward、answer reward、loss、gradient norm、token entropy，以及 clipped 方法的 clip fraction。
 
+四个 off-policy 变体均运行 200 steps，使用 seed 42：
+
+| Variant | Validation reward | Format reward | Response length | Clip fraction |
+| --- | ---: | ---: | ---: | ---: |
+| `offpolicy_naive` | 0.4688 | 0.9824 | 183.6 | - |
+| `offpolicy_noclip` | 0.4102 | 0.6758 | 154.7 | - |
+| `offpolicy_clip` | 0.4570 | 0.9004 | 114.4 | 0.0046 |
+| `offpolicy_gspo` | 0.5166 | 0.9844 | 156.4 | 0.1328 |
+
+![Off-policy GRPO 训练曲线](experiments/grpo_offpolicy_variants_seed42.png)
+
+![Off-policy 最终 Validation 指标](experiments/grpo_offpolicy_final_seed42.png)
+
+在当前 seed 下，GSPO 达到最高 validation reward 和较高的格式 reward。Token-level clip 的 clip fraction 较低，但 response length 明显缩短。GSPO 的 clip fraction 为 0.1328，训练 gradient norm 低于 token-level clip 和 noclip，曲线中的极端波动也较少。Noclip 的 validation reward 和格式 reward 最低，说明固定 rollout 上进行多次更新时，只进行 token-level reweighting、缺少 clipping 会带来更明显的稳定性问题。off-policy 结果目前只有一个 seed，结论用于比较当前配置下的行为，不能直接推广到所有运行。
+
+## 当前实验范围
+
+- Standard GRPO 已完成四个 seed；on-policy 变体和 off-policy 变体目前使用 seed 42 做对比；
+- Learning-rate sweep 和 prompt ablation 暂未纳入当前项目结果；
+- 结果重点覆盖 GSM8K reward、输出格式、response length、entropy、gradient norm 和 clipping 行为；
+- 自定义 policy-gradient estimator 和 supplement 中的 SFT、DPO、safety 实验保留为后续扩展。
+
 ## 仓库结构
 
 ```text
@@ -114,10 +181,18 @@ cs336_alignment/
 scripts/
   prompting_baselines.py     Prompting evaluation
   train_grpo.py              On-policy 和 off-policy 训练循环
+  plot_grpo_variants.py      On-policy 曲线绘图
+  plot_offpolicy_variants.py Off-policy 曲线和最终指标绘图
 data/gsm8k/                  GSM8K 数据文件
 experiments/                 Metrics、rollout 样例、图片和日志
 tests/                       单元测试和数值 snapshot
 ```
+
+主要图像文件：
+
+- `experiments/grpo_variants_seed42.png`：on-policy GRPO 变体曲线；
+- `experiments/grpo_offpolicy_variants_seed42.png`：off-policy 训练曲线；
+- `experiments/grpo_offpolicy_final_seed42.png`：off-policy 最终 validation 指标。
 
 ## 快速开始
 
