@@ -1,4 +1,6 @@
-# 从零实现小型语言模型的 Post-Training
+# Post-Training Language Model From Scratch
+
+> 从可验证奖励到策略优化的语言模型 Post-Training 实现
 
 这是一个基于 `allenai/OLMo-2-0425-1B` 和 GSM8K 的推理能力 Post-Training 实现与实验项目。
 
@@ -49,7 +51,7 @@ GSM8K 问题
 
 训练代码通过 response mask 将 Prompt token 排除在策略损失之外。Padding token 不参与 loss 和 entropy 统计。Microbatch 降低单次前向计算的显存需求，梯度在逻辑训练 batch 内累积。
 
-## 已实现内容
+## 核心实现与实验结果
 
 ### Prompting Baseline
 
@@ -117,7 +119,7 @@ experiments/                 Metrics、rollout 样例、图片和日志
 tests/                       单元测试和数值 snapshot
 ```
 
-## 环境配置
+## 快速开始
 
 项目使用 `uv` 管理环境：
 
@@ -132,7 +134,7 @@ uv sync
 uv run pytest tests/test_grpo.py
 ```
 
-## 运行实验
+### 运行实验
 
 训练脚本通过 `GRPO_VARIANT` 选择实验配置：
 
@@ -154,4 +156,3 @@ GRPO_VARIANT=offpolicy_naive GRPO_SEED=42 GRPO_STEPS=200 uv run python scripts/t
 - [GSM8K](https://github.com/openai/grade-school-math)
 - [OLMo 2](https://allenai.org/olmo)
 - [vLLM](https://github.com/vllm-project/vllm)
-
