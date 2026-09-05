@@ -131,9 +131,9 @@ Standard GRPO 额外运行了四个随机种子，用于观察 RL 训练的 run-
 
 ![On-policy GRPO 在 GSM8K 上的训练曲线](experiments/figures/on_policy/variants_seed42.png)
 
-模型在训练早期快速提升输出格式合规率，答案奖励随后逐步提升。Standard GRPO 四个 seed 的平均 validation reward 为 0.3635，高于作业要求的 0.25。Seed 114514 的 reward 只有 0.0742，但格式 reward 达到 0.9990，同时 response length 降到 14.2，说明这次运行更偏向短格式输出。较大的 reward 和 response length 方差表明单个 seed 的曲线只能用于观察训练过程，方法之间的严格比较需要更多重复实验。
+模型在训练早期快速提升输出格式合规率，答案奖励随后逐步提升。Standard GRPO 四个 seed 的平均 validation reward 为 0.3635，高于作业要求的 0.25。Seed 114514 的 reward 只有 0.0742，但格式 reward 达到 0.9990，同时 response length 降到 14.2，说明这次运行更偏向短格式输出。
 
-在 seed 42 的变体对比中，GRPO constant 与 Standard GRPO 达到相同的 validation reward，同时格式 reward 更高、response 更短。Dr. GRPO 和 RFT 的最终 reward 略低，MaxRL 与 Standard GRPO 接近。constant normalization、advantage normalization 和 RFT 的差异会同时影响更新尺度与输出长度，当前结果用于展示趋势。
+在 seed 42 的变体对比中，GRPO constant 与 Standard GRPO 达到相同的 validation reward，同时格式 reward 更高、response 更短。Dr. GRPO 和 RFT 的最终 reward 略低，MaxRL 与 Standard GRPO 接近。constant normalization、advantage normalization 和 RFT 的差异会同时影响更新尺度与输出长度。
 
 ### Learning-rate sweep
 
@@ -147,7 +147,7 @@ Standard GRPO 额外运行了四个随机种子，用于观察 RL 训练的 run-
 
 ![Learning-rate sweep](experiments/figures/learning_rate_sweep_seed42.png)
 
-在当前 seed 下，学习率从 `5e-6` 提高到 `2e-5` 后 validation reward 逐步上升。较大的学习率同时带来更长的 response 和更高的格式 reward。这个 sweep 只有一个 seed，结果用于选择后续实验配置和观察趋势。
+学习率从 `5e-6` 提高到 `2e-5` 后 validation reward 逐步上升。较大的学习率同时带来更长的 response 和更高的格式 reward。
 
 ### Prompt ablation
 
@@ -161,7 +161,7 @@ Standard GRPO 额外运行了四个随机种子，用于观察 RL 训练的 run-
 
 ![Prompt ablation](experiments/figures/prompt_ablation_seed42.png)
 
-Question-only 训练后能够稳定输出符合 boxed-answer 格式的回答，validation answer reward 仍然较低。R1 zero-shot 和 three-shot 都显著提高答案 reward。Three-shot 在当前 seed 下取得最高 validation reward，同时 response 更短；它的格式 reward 低于 zero-shot，说明 few-shot 示例带来的收益主要体现在答案行为和探索结果上。Prompt ablation 只有一个 seed，结论用于观察当前配置下的差异。
+Question-only 训练后能够稳定输出符合 boxed-answer 格式的回答，validation answer reward 仍然较低。R1 zero-shot 和 three-shot 都显著提高答案 reward。Three-shot 取得最高 validation reward，同时 response 更短；它的格式 reward 低于 zero-shot，说明 few-shot 示例带来的收益主要体现在答案行为和探索结果上。
 
 ### Off-policy 实验
 
@@ -189,7 +189,7 @@ Off-policy 训练使用一个包含 256 条 response 的 rollout batch，并进�
 
 ![Off-policy 最终 Validation 指标](experiments/figures/off_policy/final_seed42.png)
 
-在当前 seed 下，GSPO 达到最高 validation reward 和较高的格式 reward。Token-level clip 的 clip fraction 较低，但 response length 明显缩短。GSPO 的 clip fraction 为 0.1328，训练 gradient norm 低于 token-level clip 和 noclip，曲线中的极端波动也较少。Noclip 的 validation reward 和格式 reward 最低，说明固定 rollout 上进行多次更新时，只进行 token-level reweighting、缺少 clipping 会带来更明显的稳定性问题。off-policy 结果目前只有一个 seed，结论用于比较当前配置下的行为，不能直接推广到所有运行。
+GSPO 达到最高 validation reward 和较高的格式 reward。Token-level clip 的 clip fraction 较低，但 response length 明显缩短。GSPO 的 clip fraction 为 0.1328，训练 gradient norm 低于 token-level clip 和 noclip，曲线中的极端波动也较少。Noclip 的 validation reward 和格式 reward 最低，说明固定 rollout 上进行多次更新时，只进行 token-level reweighting、缺少 clipping 会带来更明显的稳定性问题。
 
 ## 当前实验范围
 
