@@ -1,0 +1,28 @@
+{
+  "variant": "standard",
+  "seed": 42,
+  "model_id": "allenai/OLMo-2-0425-1B",
+  "prompt_name": "three_shot",
+  "prompt_path": "post_training/prompts/gsm8k/r1_zero_three_shot_gsm8k.prompt",
+  "n_train_examples": 6400,
+  "n_val_examples": 1024,
+  "num_rollout_steps": 200,
+  "rollout_batch_size": 256,
+  "train_batch_size": 256,
+  "num_train_updates_per_rollout": 1,
+  "group_size": 8,
+  "gradient_accumulation_steps": 128,
+  "learning_rate": 1e-05,
+  "temperature": 1.0,
+  "max_tokens": 512,
+  "max_grad_norm": 1.0,
+  "eval_every": 10,
+  "variant_config": {
+    "baseline": "mean",
+    "advantage_normalizer": "std",
+    "loss_normalization": "sequence",
+    "normalization_constant": null,
+    "importance_reweighting_method": "none",
+    "cliprange": null
+  }
+}

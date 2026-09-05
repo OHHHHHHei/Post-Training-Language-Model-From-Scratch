@@ -135,6 +135,34 @@ Standard GRPO 额外运行了四个随机种子，用于观察 RL 训练的 run-
 
 在 seed 42 的变体对比中，GRPO constant 与 Standard GRPO 达到相同的 validation reward，同时格式 reward 更高、response 更短。Dr. GRPO 和 RFT 的最终 reward 略低，MaxRL 与 Standard GRPO 接近。constant normalization、advantage normalization 和 RFT 的差异会同时影响更新尺度与输出长度，当前结果用于展示趋势。
 
+### Learning-rate sweep
+
+在 zero-shot `r1_zero` Prompt 下比较 `5e-6`、`1e-5` 和 `2e-5`。`1e-5` 直接使用 Standard GRPO 的 seed42 结果。
+
+| Learning rate | Validation reward | Format reward | Response length |
+| ---: | ---: | ---: | ---: |
+| `5e-6` | 0.3818 | 0.9209 | 122.1 |
+| `1e-5` | 0.4512 | 0.9170 | 131.4 |
+| `2e-5` | 0.4756 | 0.9922 | 137.7 |
+
+![Learning-rate sweep](experiments/figures/learning_rate_sweep_seed42.png)
+
+在当前 seed 下，学习率从 `5e-6` 提高到 `2e-5` 后 validation reward 逐步上升。较大的学习率同时带来更长的 response 和更高的格式 reward。这个 sweep 只有一个 seed，结果用于选择后续实验配置和观察趋势。
+
+### Prompt ablation
+
+使用 Standard GRPO 和相同的训练超参数，比较 question-only、zero-shot `r1_zero` 和 three-shot `r1_zero` Prompt。Question-only 使用对应的 boxed-answer grader，R1 Prompt 使用 `<think>` 和 `<answer>` grader。
+
+| Prompt | Validation reward | Format reward | Response length |
+| --- | ---: | ---: | ---: |
+| Question-only | 0.0742 | 0.9912 | 95.1 |
+| R1 zero-shot | 0.4512 | 0.9170 | 131.4 |
+| R1 three-shot | 0.4629 | 0.8770 | 113.7 |
+
+![Prompt ablation](experiments/figures/prompt_ablation_seed42.png)
+
+Question-only 训练后能够稳定输出符合 boxed-answer 格式的回答，validation answer reward 仍然较低。R1 zero-shot 和 three-shot 都显著提高答案 reward。Three-shot 在当前 seed 下取得最高 validation reward，同时 response 更短；它的格式 reward 低于 zero-shot，说明 few-shot 示例带来的收益主要体现在答案行为和探索结果上。Prompt ablation 只有一个 seed，结论用于观察当前配置下的差异。
+
 ### Off-policy 实验
 
 Off-policy 训练使用一个包含 256 条 response 的 rollout batch，并进行 32 次训练更新。每次更新使用 8 条 response。第一次参数更新前计算旧策略的 log probabilities，后续更新持续使用这组固定值。
@@ -166,9 +194,9 @@ Off-policy 训练使用一个包含 256 条 response 的 rollout batch，并进�
 ## 当前实验范围
 
 - Standard GRPO 已完成四个 seed；on-policy 变体和 off-policy 变体目前使用 seed 42 做对比；
-- Learning-rate sweep 和 prompt ablation 暂未纳入当前项目结果；
+- Learning-rate sweep 和 prompt ablation 已完成 seed 42 实验；
 - 结果重点覆盖 GSM8K reward、输出格式、response length、entropy、gradient norm 和 clipping 行为；
-- 自定义 policy-gradient estimator 和 supplement 中的 SFT、DPO、safety 实验保留为后续扩展。
+- 其余变体的多 seed 扩展、自定义 policy-gradient estimator 和 supplement 中的 SFT、DPO、safety 实验保留为后续扩展。
 
 ## 仓库结构
 
@@ -189,6 +217,8 @@ data/
 experiments/
   on_policy/                  On-policy 训练结果
   off_policy/                 Off-policy 训练结果和失败运行归档
+  learning_rate_sweep/        Learning-rate sweep 结果
+  prompt_ablation/             Prompt ablation 结果
   figures/                    训练曲线和最终指标图
   logs/                       训练日志
 docs/                         课程材料
@@ -198,6 +228,8 @@ tests/                       单元测试和数值 snapshot
 主要图像文件：
 
 - `experiments/figures/on_policy/variants_seed42.png`：on-policy GRPO 变体曲线；
+- `experiments/figures/learning_rate_sweep_seed42.png`：learning-rate sweep 结果；
+- `experiments/figures/prompt_ablation_seed42.png`：Prompt ablation 曲线；
 - `experiments/figures/off_policy/variants_seed42.png`：off-policy 训练曲线；
 - `experiments/figures/off_policy/final_seed42.png`：off-policy 最终 validation 指标。
 
@@ -214,7 +246,7 @@ uv sync --extra gpu --extra plots
 运行 GRPO 测试：
 
 ```bash
-uv run pytest tests/test_grpo.py
+uv run --extra gpu --extra plots pytest tests/test_grpo.py
 ```
 
 ### 运行实验
@@ -222,13 +254,19 @@ uv run pytest tests/test_grpo.py
 训练脚本通过 `GRPO_VARIANT` 选择实验配置：
 
 ```bash
-GRPO_VARIANT=standard GRPO_SEED=42 GRPO_STEPS=200 uv run python scripts/training/train_grpo.py
+GRPO_VARIANT=standard GRPO_SEED=42 GRPO_STEPS=200 uv run --extra gpu --extra plots python scripts/training/train_grpo.py
 ```
 
 运行 off-policy variant：
 
 ```bash
-GRPO_VARIANT=offpolicy_naive GRPO_SEED=42 GRPO_STEPS=200 uv run python scripts/training/train_grpo.py
+GRPO_VARIANT=offpolicy_naive GRPO_SEED=42 GRPO_STEPS=200 uv run --extra gpu --extra plots python scripts/training/train_grpo.py
+```
+
+选择 Prompt 和学习率：
+
+```bash
+GRPO_PROMPT=three_shot GRPO_LR=1e-5 GRPO_SEED=42 GRPO_STEPS=200 uv run --extra gpu --extra plots python scripts/training/train_grpo.py
 ```
 
 重新生成训练曲线：
@@ -236,6 +274,8 @@ GRPO_VARIANT=offpolicy_naive GRPO_SEED=42 GRPO_STEPS=200 uv run python scripts/t
 ```bash
 python3 scripts/plotting/plot_grpo_variants.py
 python3 scripts/plotting/plot_offpolicy_variants.py
+python3 scripts/plotting/plot_learning_rate.py
+python3 scripts/plotting/plot_prompt_ablation.py
 ```
 
 默认硬件配置将策略模型放在逻辑设备 `cuda:0`，将 vLLM 放在物理 GPU 2。使用 `CUDA_VISIBLE_DEVICES` 可以指定策略模型使用的物理 GPU。
